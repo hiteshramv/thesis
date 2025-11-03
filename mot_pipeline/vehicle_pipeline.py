@@ -39,6 +39,7 @@ class MeasurementAssociationOutput:
     unmatched_detections_by_cam: Dict[int, List[int]]
 
 pcdhelper = PcdHelper()
+
 def run_measurement_association_sdiou(
     tracks: TrackObject3dList,
     detections: List[ImageDetectionList],                 # <— CHANGED: list, not dict
@@ -193,7 +194,7 @@ def _project_tracks_to_xyxy(
 
     track_ids, boxes = [], []
     for tobj in tracks.track_objects_3d:
-        box = _project_single_3d_box_xyxy_using_helper(tobj.object_3d, K, E, image_shape)
+        box = project_single_3d_box_xyxy_using_helper(tobj.object_3d, K, E, image_shape)
         if box is None:
             continue
         track_ids.append(int(tobj.track_id))
@@ -201,7 +202,7 @@ def _project_tracks_to_xyxy(
     return track_ids, boxes
 
 
-def _project_single_3d_box_xyxy_using_helper(
+def project_single_3d_box_xyxy_using_helper(
     obj,                       # Object3d
     K: np.ndarray,             # 3x3
     E: np.ndarray,             # 3x4
@@ -209,7 +210,7 @@ def _project_single_3d_box_xyxy_using_helper(
 ):
     # sizes
     l, w, h = float(obj.size.x), float(obj.size.y), float(obj.size.z)
-    cx, cy, cz = float(obj.position.x), float(obj.position.y), float(obj.position.z)
+    cx, cy, cz = float(obj.position.x), float(obj.position.y), float(obj.position.z)-2.9
     yaw = float(obj.yaw_angle)
 
     # 8 local corners (centered box, z: bottom = -h/2, top = +h/2)
@@ -235,8 +236,13 @@ def _project_single_3d_box_xyxy_using_helper(
         return None
     return (u1, v1, u2, v2)
 
+# Corrected function for vehicle_pipeline.py
 def _det_xyxy(d: ImageDetection) -> Tuple[float,float,float,float]:
-    return (d.x, d.y, d.x + d.w, d.y + d.h)
+    x1 = d.x - d.w / 2.0
+    y1 = d.y - d.h / 2.0
+    x2 = d.x + d.w / 2.0
+    y2 = d.y + d.h / 2.0
+    return (x1, y1, x2, y2)
 
 # -------- SDIoU (2D) --------
 
