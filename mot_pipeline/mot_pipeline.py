@@ -13,6 +13,11 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import rclpy
 from dataloading import SensorDataLoader
 from detector2D import Detector2D
+# mot_pipeline/mot_pipeline.py
+from vehicle_pipeline import run_measurement_association_sdiou
+from datastructures.calibration_manager import CalibrationManager
+from datastructures.final_calibration_dict import calibration_data
+
 import visualization
 import time
 import logging
@@ -32,24 +37,45 @@ def main(args=None):
     rclpy.init(args=args)
     node = SensorDataLoader()
     detector = Detector2D(model_path='yolo11s_inani.engine', conf=0.35)
+    calib = CalibrationManager(calibration_data)
+
     try:
         while rclpy.ok():
             rclpy.spin_once(node, timeout_sec=0.1)
             start_time = time.time()
             images = node.get_latest_images()
+            track_list = node.get_latest_tracks()
 
             # Log image info for all cameras in the set
             for i, img in enumerate(images):
                 if img is not None:
-                    logger.info(f"Camera: {img.camera_id}, Timestamp: {img.time_stamp}")
+                    logger.info(f"Camera: {img.camera_id}, Timestamp: {img.time_stamp}")  
                 #else:
                     #logger.warning(f"Image {i+1} is None.")
 
             if all(img is not None for img in images):
+                image_shapes_by_cam = {
+                    images[0].camera_id: images[0].data.shape[:2],   # (H, W)
+                    images[1].camera_id: images[1].data.shape[:2],
+                    images[2].camera_id: images[2].data.shape[:2],
+                    }
                 detections = detector.detect(images)
                 elapsed = time.time() - start_time
                 logger.info(f"Processing time for this set of 3 images: {elapsed*1000:.1f} ms")
                 visualization.show(images, detections)
+
+
+                assoc_out = run_measurement_association_sdiou(
+                    tracks=track_list,
+                    detections=detections,            # <— list, not dict
+                    image_shapes_by_cam=image_shapes_by_cam,
+                    calib=calib,
+                    min_sdiou=0.30,
+                    large_box_px_area=14000,
+                    class_map={"car": ["car"], "truck": ["truck"]},
+                    update_class_on_confirm=True,
+                    perform_merging=True
+                )
     except KeyboardInterrupt:
         logger.info("Shutting down...")
     finally:

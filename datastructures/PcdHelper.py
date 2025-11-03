@@ -1482,3 +1482,54 @@ DATA {DATA}
 
         return cloud
 
+
+
+    def project_points_uv(
+        self,
+        pts_xyz: np.ndarray,                # shape (N, 3)
+        image_shape: Tuple[int, int, int],  # (rows, cols, channels)
+        intrinsic: np.ndarray,              # 3x3
+        extrinsic: np.ndarray               # 3x4  (camera <- world/sensor)
+    ) -> np.recarray:
+        """
+        Projects arbitrary 3D points to an image using 3x3 K and 3x4 [R|t].
+        Returns recarray with fields ['u','v','w'] for points inside the image bounds.
+        """
+        assert pts_xyz.ndim == 2 and pts_xyz.shape[1] == 3, "pts_xyz must be (N,3)"
+        rows, cols = (image_shape[0], image_shape[1])
+
+        # build a recarray similar to your project_pcd_on_image input
+        N = pts_xyz.shape[0]
+        rec_dtype = np.dtype([
+            ("x", np.float64), ("y", np.float64), ("z", np.float64),
+            ("index", np.uint32)
+        ])
+        cloud = np.empty(N, dtype=rec_dtype)
+        cloud["x"] = pts_xyz[:, 0]
+        cloud["y"] = pts_xyz[:, 1]
+        cloud["z"] = pts_xyz[:, 2]
+        cloud["index"] = np.arange(N, dtype=np.uint32)
+
+        # build (N,4) with last col = 1
+        cloud_xyz = cloud[["x", "y", "z", "index"]].copy()
+        cloud_xyz["index"] = 1
+
+        # P = K [R|t]
+        P = intrinsic @ extrinsic  # (3x3)*(3x4) -> (3x4)
+
+        proj = P @ rfn.structured_to_unstructured(cloud_xyz).T  # (3x4)*(4xN) -> (3xN)
+        w = proj[2, :]
+
+        # normalize
+        uv = np.vstack([proj[0, :] / w, proj[1, :] / w])  # (2xN)
+        uv = uv.T  # (N,2): [u,v]
+
+        # keep only points with w>0 and inside the image
+        mask = (w > 1e-6) & (uv[:, 0] >= 0) & (uv[:, 1] >= 0) & (uv[:, 0] < cols) & (uv[:, 1] < rows)
+        if not np.any(mask):
+            return None
+
+        uvw = np.column_stack([uv[mask, 0], uv[mask, 1], w[mask]])
+        dtype = np.dtype({"names": ["u", "v", "w"], "formats": [np.float32, np.float32, np.float32]})
+        uvw_rec = rfn.unstructured_to_structured(uvw, dtype=dtype)
+        return uvw_rec

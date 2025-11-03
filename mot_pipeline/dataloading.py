@@ -89,7 +89,7 @@ class SensorDataLoader(Node):
         image3 = ImageData(3, to_datetime_utc(img3.header.stamp), img_bgr3)
         
         self.image_queue.append([image1, image2, image3]) 
-"""
+    """
         if self.last_track_list:
             try:
                 debug_path = "lidar_track_log.txt"  # change path if you want
@@ -104,7 +104,7 @@ class SensorDataLoader(Node):
                 )
             except Exception as e:
                 self.get_logger().warn(f"Failed to log track list: {e}")
-"""
+    """
 
 
 
