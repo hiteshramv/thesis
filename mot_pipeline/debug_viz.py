@@ -1,7 +1,7 @@
 import cv2
 import math
 import numpy as np
-from typing import Dict, Tuple, List, Optional
+from typing import Dict, Tuple, List, Optional, Set
 
 # If your helper is a module-level function:
 from datastructures.PcdHelper import PcdHelper
@@ -24,6 +24,26 @@ FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 pcdhelper = PcdHelper()
 
+# ---------- Filters ----------
+ALLOWED_CLASSES: Set[str] = {"car", "van", "truck", "bus", "motorcycle", "motercycle"}  # include common typo
+ROI_HALF_WIDTH_M: float = 50.0   # keep |Y| <= 50 m (assumes Y is lateral; swap to X if needed)
+
+def _name_ok(name: Optional[str]) -> bool:
+    return bool(name) and name.lower() in ALLOWED_CLASSES
+
+def _within_lr_roi(tobj: TrackObject3d, halfwidth_m: float = ROI_HALF_WIDTH_M) -> bool:
+    """
+    Keep objects with |Y| <= halfwidth_m (± left/right band).
+    NOTE: Assumes world Y is lateral (left/right). If your lateral axis is X,
+    switch to abs(tobj.object_3d.position.x).
+    """
+    try:
+        y = float(tobj.object_3d.position.y)
+        return abs(y) <= float(halfwidth_m)
+    except Exception:
+        return True  # if unsure, don't drop it silently
+
+
 def _put_text(img, text, org, color=C_WHITE, scale=0.5, thickness=1):
     cv2.putText(img, text, org, FONT, scale, color, thickness, cv2.LINE_AA)
 
@@ -41,16 +61,14 @@ def _project_box_corners_uv(tobj: TrackObject3d, K, E, image_shape):
     """Return (N,2) uv array for the 8 corners that fall in the image."""
     obj = tobj.object_3d
     l, w, h = float(obj.size.x), float(obj.size.y), float(obj.size.z)
-    cx, cy, cz = float(obj.position.x), float(obj.position.y), float(obj.position.z)-2.9
+    cx, cy, cz = float(obj.position.x), float(obj.position.y), float(obj.position.z) - 2.9
     yaw = float(obj.yaw_angle)
-
-    #print(f"Projecting T{tobj.track_id}: cz={cz}, h={h}")
 
     xs = np.array([+l/2, +l/2, -l/2, -l/2, +l/2, +l/2, -l/2, -l/2], dtype=np.float64)
     ys = np.array([+w/2, -w/2, -w/2, +w/2, +w/2, -w/2, -w/2, +w/2], dtype=np.float64)
-    # NEW (assumes cz is TOP)
+    # If cz is TOP, using [ -h, ... , 0 ] keeps visuals closer to ground contact; otherwise use ±h/2
     zs = np.array([-h, -h, -h, -h, 0, 0, 0, 0], dtype=np.float64)
-    #zs = np.array([-h/2, -h/2, -h/2, -h/2, +h/2, +h/2, +h/2, +h/2], dtype=np.float64)
+    # zs = np.array([-h/2, -h/2, -h/2, -h/2, +h/2, +h/2, +h/2, +h/2], dtype=np.float64)
 
     c, s = math.cos(yaw), math.sin(yaw)
     X = xs * c - ys * s + cx
@@ -58,7 +76,6 @@ def _project_box_corners_uv(tobj: TrackObject3d, K, E, image_shape):
     Z = zs + cz
     corners = np.vstack([X, Y, Z]).T  # (8,3)
 
-    # If your helper is a staticmethod: uvw = PcdHelper.project_points_uv(corners, (H,W,3), K, E)
     H, W = image_shape[:2]
     uvw = pcdhelper.project_points_uv(corners, (H, W, 3), K, E)
     if uvw is None or uvw.size == 0:
@@ -89,17 +106,20 @@ def draw_overlays_for_camera(
     """
     Returns an annotated copy showing:
       - camera 2D boxes (yellow)
-      - projected LiDAR boxes (cyan)
-      - associations (green) from assoc_out.class_confirmations (SDIoU + link)
-      - merged LiDAR (magenta outline on kept box)
+      - projected LiDAR boxes (cyan) — filtered by (class ∈ ALLOWED_CLASSES) ∧ (|Y| <= 50m)
+      - associations (green) from assoc_out.class_confirmations (only if the LiDAR object passes the filter)
+      - merged LiDAR (magenta outline on kept box, if it passes the filter)
     """
     out = image.copy()
     H, W = out.shape[:2]
 
-    # 1) 2D camera boxes
+    # 1) 2D camera boxes (kept as-is; we do NOT filter camera dets here)
     if det_list is not None:
         for j, det in enumerate(det_list.detections):
-            x1, y1, x2, y2 = int(det.x-(det.w/2)), int(det.y-(det.h/2)), int(det.x+(det.w/2)), int(det.y+(det.h/2))
+            x1 = int(det.x - det.w / 2)
+            y1 = int(det.y - det.h / 2)
+            x2 = int(det.x + det.w / 2)
+            y2 = int(det.y + det.h / 2)
             cv2.rectangle(out, (x1, y1), (x2, y2), C_YELLOW, 2)
             label = det.class_name or ""
             if hasattr(det, "score") and det.score is not None:
@@ -110,8 +130,14 @@ def draw_overlays_for_camera(
     K = calib.get_intrinsic(cam_id)
     E = _coerce_3x4(calib.get_extrinsic(cam_id))
 
-    # 2) projected LiDAR boxes
+    # 2) projected LiDAR boxes (FILTERED)
     for tobj in track_list.track_objects_3d:
+        # filter by class + ROI
+        if not _name_ok(tobj.object_3d.class_name):
+            continue
+        if not _within_lr_roi(tobj, ROI_HALF_WIDTH_M):
+            continue
+
         xyxy = _project_box_xyxy(tobj, K, E, (H, W))
         if xyxy is None:
             continue
@@ -131,8 +157,7 @@ def draw_overlays_for_camera(
                     u2, v2 = int(uv[j, 0]), int(uv[j, 1])
                     cv2.line(out, (u1, v1), (u2, v2), (180, 180, 255), 2)
 
-    # 3) associations from class_confirmations (track_id, camera_id, det_index, sdiou)
-    # Group per camera and draw links + SDIoU
+    # 3) associations from class_confirmations (draw link only if LiDAR passes filter)
     confs = [c for c in getattr(assoc_out, "class_confirmations", []) if int(c.camera_id) == int(cam_id)]
     if det_list is not None and confs:
         for c in confs:
@@ -142,10 +167,15 @@ def draw_overlays_for_camera(
             cx = int(d.x + 0.5 * d.w)
             cy = int(d.y + 0.5 * d.h)
 
-            # projected LiDAR center
+            # get corresponding LiDAR track & re-check filters
             tobj = next((t for t in track_list.track_objects_3d if int(t.track_id) == int(c.track_id)), None)
             if tobj is None:
                 continue
+            if not _name_ok(tobj.object_3d.class_name):
+                continue
+            if not _within_lr_roi(tobj, ROI_HALF_WIDTH_M):
+                continue
+
             xyxy = _project_box_xyxy(tobj, K, E, (H, W))
             if xyxy is None:
                 continue
@@ -161,7 +191,7 @@ def draw_overlays_for_camera(
             if new_cls and new_cls != prev_cls:
                 _put_text(out, f"{prev_cls}->{new_cls}", (min(lx, cx) + 4, min(ly, cy) - 22), C_GREEN, 0.5)
 
-    # 4) merged LiDAR boxes — highlight the kept box (magenta)
+    # 4) merged LiDAR boxes — highlight only if kept box passes filter
     for m in getattr(assoc_out, "merges", []):
         if int(m.camera_id) != int(cam_id):
             continue
@@ -169,6 +199,11 @@ def draw_overlays_for_camera(
         tobj = next((t for t in track_list.track_objects_3d if int(t.track_id) == kept_id), None)
         if tobj is None:
             continue
+        if not _name_ok(tobj.object_3d.class_name):
+            continue
+        if not _within_lr_roi(tobj, ROI_HALF_WIDTH_M):
+            continue
+
         xyxy = _project_box_xyxy(tobj, K, E, (H, W))
         if xyxy is None:
             continue
@@ -178,6 +213,7 @@ def draw_overlays_for_camera(
 
     # quick legend
     _put_text(out, "2D det: yellow | LiDAR proj: cyan | assoc: green | merged: magenta", (10, 20), C_WHITE, 0.5)
+    _put_text(out, f"Filter: classes={sorted(ALLOWED_CLASSES)} | |Y|≤{int(ROI_HALF_WIDTH_M)}m", (10, 40), C_WHITE, 0.5)
     return out
 
 
@@ -196,7 +232,6 @@ def render_overlays_for_all_cams(
     Returns canvases for each input image (same order).
     Optionally shows with cv2.imshow and/or saves to out_dir.
     """
-    # quick lookup for detections per cam
     det_by_cam: Dict[int, ImageDetectionList] = {int(d.camera_id): d for d in detections}
     canvases: List[np.ndarray] = []
 
@@ -263,13 +298,11 @@ def render_hstack_and_save(
     # decide order
     if cam_order is None:
         cam_order = [int(img.camera_id) for img in images if img is not None]
-    # ensure unique and sorted for stability
-    cam_order = sorted(list(dict.fromkeys(cam_order)))  # preserves order, removes dups then sorts
+    cam_order = sorted(list(dict.fromkeys(cam_order)))  # unique & sorted
 
     # Build canvases (overlay per camera) or black placeholders if missing
     canvases: List[np.ndarray] = []
     for cam_id in cam_order:
-        # find this camera's image
         img_obj = next((im for im in images if im is not None and int(im.camera_id) == cam_id), None)
         if img_obj is None:
             canvas = _black_canvas_for_cam(calib, cam_id)
@@ -292,7 +325,6 @@ def render_hstack_and_save(
     resized = []
     for c in canvases:
         if c is None:
-            # shouldn't happen, but keep safe
             c = np.zeros((target_h, target_h, 3), dtype=np.uint8)
         h, w = c.shape[:2]
         if h != target_h:
