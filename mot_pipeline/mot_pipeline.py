@@ -5,6 +5,8 @@
 
 #ros2 bag play "/home/vh17r/ros2_yolo/inani/inani__2025-10-17_07-30-27-642__bag1" --clock
 
+
+# mot_pipeline/mot_pipeline.py
 import sys
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -18,7 +20,9 @@ from detector2D import Detector2D
 from vehicle_pipeline import run_measurement_association_sdiou
 from datastructures.calibration_manager import CalibrationManager
 from datastructures.final_calibration_dict import calibration_data
-from debug_viz import render_overlays_for_all_cams
+
+# overlay + hstack saver (from your debug_viz.py)
+from debug_viz import render_hstack_and_save, render_overlays_for_all_cams
 
 # ---------------- logging ----------------
 logging.basicConfig(
@@ -31,6 +35,174 @@ logger = logging.getLogger("mot_pipeline")
 
 def _build_shapes_by_cam(images):
     """Return {cam_id: (H,W)} and {cam_id: ImageData} for all non-None images."""
+    image_shapes_by_cam = {}
+    images_by_cam = {}
+    for img in images:
+        if img is None:
+            continue
+        H, W = img.data.shape[:2]
+        cam_id = int(img.camera_id)
+        image_shapes_by_cam[cam_id] = (H, W)
+        images_by_cam[cam_id] = img
+    return image_shapes_by_cam, images_by_cam
+
+
+def _log_assoc_results(assoc_out, detections):
+    # per-camera counts
+    for dl in detections:
+        cam_id = int(dl.camera_id)
+        n2d = len(dl.detections)
+        u_lidar = assoc_out.unmatched_tracks_by_cam.get(cam_id, [])
+        u_2d = assoc_out.unmatched_detections_by_cam.get(cam_id, [])
+        logger.info(f"[cam{cam_id}] 2D={n2d}  unmatched LiDAR={len(u_lidar)}  unmatched 2D={len(u_2d)}")
+
+    # class confirmations
+    for c in assoc_out.class_confirmations:
+        prev = c.prev_class or ""
+        new = c.confirmed_class or ""
+        changed = " (UPDATED)" if new and new != prev else ""
+        logger.info(f"[CONFIRM] T{c.track_id} via cam{c.camera_id}: SDIoU={c.sdiou:.2f} {prev}->{new}{changed}")
+
+    # merges
+    for m in assoc_out.merges:
+        sdiou_str = ", ".join(f"{s:.2f}" for s in m.sdiou_values)
+        logger.info(f"[MERGE] cam{m.camera_id} det#{m.det_index} "
+                    f"LiDAR {m.track_ids_merged} -> kept {m.new_track_object.track_id} "
+                    f"(SDIoUs=[{sdiou_str}])")
+
+
+
+def main(args=None):
+    rclpy.init(args=args)
+
+    # sensor reader + detector
+    node = SensorDataLoader()
+    detector = Detector2D(model_path='yolo11s_inani.engine', conf=0.35)
+
+    # calibration
+    calib = CalibrationManager(calibration_data)
+
+    # class compatibility map (measurement-level): keep it strict for vehicles
+    class_compat = {"bus": ["bus"], "truck": ["truck"], "car": ["car"], "van": ["van"]}
+
+    # where to save h-stacked frames
+    out_dir = "/home/vh17r/ros2_yolo/inani/inani_viz"
+
+    try:
+        while rclpy.ok():
+            rclpy.spin_once(node, timeout_sec=0.1)
+
+            # inputs
+            images = node.get_latest_images()      # List[ImageData], may contain None
+            track_list = node.get_latest_tracks()  # TrackObject3dList
+
+            # skip until at least one camera is available
+            if not images or all(img is None for img in images):
+                continue
+
+            # log timestamps of available cameras
+            for img in images:
+                if img is not None:
+                    logger.info(f"Camera: {img.camera_id}, Timestamp: {img.time_stamp}")
+
+            # shapes and available images
+            image_shapes_by_cam, images_by_cam = _build_shapes_by_cam(images)
+            if not images_by_cam:
+                continue
+
+            # run 2D detector on available images in ascending cam_id order
+            cam_ids_sorted = sorted(images_by_cam.keys())
+            imgs_for_detector = [images_by_cam[cid] for cid in cam_ids_sorted]
+            detections = detector.detect(imgs_for_detector)
+            # NOTE: Detector2D must set .camera_id in each ImageDetectionList matching the input images
+
+            # association
+            t0 = time.time()
+            assoc_out = run_measurement_association_sdiou(
+                tracks=track_list,
+                detections=detections,             # list[ImageDetectionList] (each has .camera_id)
+                image_shapes_by_cam=image_shapes_by_cam,
+                calib=calib,
+                min_sdiou=0.30,
+                large_box_px_area=14000,
+                class_map=None,
+                update_class_on_confirm=True,
+                perform_merging=True
+            )
+            elapsed_ms = (time.time() - t0) * 1000.0
+            logger.info(f"Association took: {elapsed_ms:.1f} ms")
+
+            # logs (counts, confirmations, merges)
+            _log_assoc_results(assoc_out, detections)
+
+            # -------- overlays + H-stack save by LiDAR timestamp --------
+            lidar_ts = track_list.epoch_time
+
+            # You can either save just the wide hstack (fast), or also keep per-cam images:
+            # 1) Direct hstack & save (recommended)
+            render_hstack_and_save(
+                images=[images_by_cam[cid] for cid in cam_ids_sorted],
+                detections=detections,
+                track_list=track_list,
+                calib=calib,
+                assoc_out=assoc_out,
+                lidar_timestamp=lidar_ts,
+                out_dir=out_dir,
+                show=True,               # set True if you want a live preview window
+                draw_wireframe_3d=False,   # False for speed
+                cam_order=cam_ids_sorted
+            )
+
+            # 2) (Optional) also save individual per-camera overlays (comment out if not needed)
+            # render_overlays_for_all_cams(
+            #     images=[images_by_cam[cid] for cid in cam_ids_sorted],
+            #     detections=detections,
+            #     track_list=track_list,
+            #     calib=calib,
+            #     assoc_out=assoc_out,
+            #     show=False,
+            #     out_dir=os.path.join(out_dir, "per_cam"),
+            #     frame_id=node.get_frame_index() if hasattr(node, "get_frame_index") else None,
+            #     draw_wireframe_3d=True
+            # )
+
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
+
+"""
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+import time
+import logging
+import rclpy
+
+from dataloading import SensorDataLoader
+from detector2D import Detector2D
+from vehicle_pipeline import run_measurement_association_sdiou
+from datastructures.calibration_manager import CalibrationManager
+from datastructures.final_calibration_dict import calibration_data
+from debug_viz import render_overlays_for_all_cams, render_hstack_and_save
+
+# ---------------- logging ----------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[logging.FileHandler("mot_pipeline.txt"), logging.StreamHandler()]
+)
+logger = logging.getLogger("mot_pipeline")
+
+
+def _build_shapes_by_cam(images):
+    #Return {cam_id: (H,W)} and {cam_id: ImageData} for all non-None images.
     image_shapes_by_cam = {}
     images_by_cam = {}
     for img in images:
@@ -135,7 +307,7 @@ def main(args=None):
                 calib=calib,
                 assoc_out=assoc_out,
                 show=True,                # set False to avoid GUI popups
-                out_dir="/tmp/inani_viz", # or None to skip saving
+                out_dir="/home/vh17r/ros2_yolo/inani/inani_viz", # or None to skip saving
                 frame_id=node.get_frame_index() if hasattr(node, "get_frame_index") else None,
                 draw_wireframe_3d=True   # True if you want corner wireframes
                 )
@@ -152,7 +324,7 @@ def main(args=None):
 if __name__ == "__main__":
     main()
 
-
+"""
 
 
 """

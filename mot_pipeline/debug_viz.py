@@ -229,3 +229,87 @@ def render_overlays_for_all_cams(
         cv2.waitKey(1)
 
     return canvases
+
+
+def _black_canvas_for_cam(calib: CalibrationManager, cam_id: int) -> np.ndarray:
+    key = f"camera_{int(cam_id):02d}"
+    H = int(calib.data["cameras"][key].get("image_height", 1200))
+    W = int(calib.data["cameras"][key].get("image_width", 1920))
+    return np.zeros((H, W, 3), dtype=np.uint8)
+
+
+def render_hstack_and_save(
+    images: List[ImageData],
+    detections: List[ImageDetectionList],
+    track_list: TrackObject3dList,
+    calib: CalibrationManager,
+    assoc_out,
+    lidar_timestamp: str,                 # e.g. "1760679240.400150204" or "2025-10-17_07-30-40-429"
+    out_dir: str,
+    show: bool = True,
+    draw_wireframe_3d: bool = False,
+    cam_order: Optional[List[int]] = None # e.g. [1,2,3]; if None, uses order of `images`
+) -> str:
+    """
+    Renders overlays for up to 3 cameras, stacks them horizontally, and saves as <lidar_timestamp>.jpg.
+    Returns the saved filepath.
+    """
+    import os
+    os.makedirs(out_dir, exist_ok=True)
+
+    # map detections by camera for quick lookup
+    det_by_cam: Dict[int, ImageDetectionList] = {int(d.camera_id): d for d in detections}
+
+    # decide order
+    if cam_order is None:
+        cam_order = [int(img.camera_id) for img in images if img is not None]
+    # ensure unique and sorted for stability
+    cam_order = sorted(list(dict.fromkeys(cam_order)))  # preserves order, removes dups then sorts
+
+    # Build canvases (overlay per camera) or black placeholders if missing
+    canvases: List[np.ndarray] = []
+    for cam_id in cam_order:
+        # find this camera's image
+        img_obj = next((im for im in images if im is not None and int(im.camera_id) == cam_id), None)
+        if img_obj is None:
+            canvas = _black_canvas_for_cam(calib, cam_id)
+        else:
+            det_list = det_by_cam.get(cam_id, None)
+            canvas = draw_overlays_for_camera(
+                image=img_obj.data,
+                cam_id=cam_id,
+                det_list=det_list,
+                track_list=track_list,
+                calib=calib,
+                assoc_out=assoc_out,
+                draw_wireframe_3d=draw_wireframe_3d
+            )
+        canvases.append(canvas)
+
+    # Make all canvases the same height (use min height to avoid upscaling too much)
+    heights = [c.shape[0] for c in canvases if c is not None]
+    target_h = min(heights) if heights else 720
+    resized = []
+    for c in canvases:
+        if c is None:
+            # shouldn't happen, but keep safe
+            c = np.zeros((target_h, target_h, 3), dtype=np.uint8)
+        h, w = c.shape[:2]
+        if h != target_h:
+            scale = target_h / float(h)
+            c = cv2.resize(c, (int(w * scale), target_h))
+        resized.append(c)
+
+    # Stack horizontally
+    stacked = np.hstack(resized) if len(resized) > 1 else resized[0]
+
+    # Sanitize timestamp for filename
+    safe_ts = str(lidar_timestamp).replace(":", "-").replace(" ", "_").replace("/", "_")
+    out_path = os.path.join(out_dir, f"{safe_ts}.jpg")
+    cv2.imwrite(out_path, stacked)
+
+    if show:
+        cv2.imshow("INANI | cam1 | cam2 | cam3", stacked)
+        cv2.waitKey(1)
+
+    return out_path

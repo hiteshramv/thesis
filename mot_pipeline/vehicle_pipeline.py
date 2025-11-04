@@ -42,12 +42,12 @@ pcdhelper = PcdHelper()
 
 def run_measurement_association_sdiou(
     tracks: TrackObject3dList,
-    detections: List[ImageDetectionList],                 # <— CHANGED: list, not dict
+    detections: List[ImageDetectionList],
     image_shapes_by_cam: Dict[int, Tuple[int, int]],
     calib: CalibrationManager,
     *,
     min_sdiou: float = 0.30,
-    large_box_px_area: int = 14000,
+    large_box_px_area: int = 1400,
     class_map: Optional[Dict[str, List[str]]] = None,
     update_class_on_confirm: bool = True,
     perform_merging: bool = True
@@ -133,7 +133,7 @@ def run_measurement_association_sdiou(
 
 def _associate_per_camera_sdiou(
     tracks: TrackObject3dList,
-    detections: List[ImageDetectionList],                # <— CHANGED: list, not dict
+    detections: List[ImageDetectionList],
     image_shapes_by_cam: Dict[int, Tuple[int, int]],
     calib: CalibrationManager,
     min_sdiou: float
