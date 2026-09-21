@@ -160,13 +160,13 @@ class MultiCamProjector:
         return w, h
 
     def project_object_to_xyxy(self, obj3d: Object3d, cam_id: int) -> Optional[Tuple[float, float, float, float]]:
-        K = self.cm.get_intrinsic(cam_id)                   # (3,3)
-        dist = self.cm.get_distortion(cam_id).reshape(-1)   # (5,)
-        Ext = self.cm.get_extrinsic(cam_id)                 # (3,4)
+        K = self.cm.get_intrinsic(cam_id)                   
+        dist = self.cm.get_distortion(cam_id).reshape(-1)   
+        Ext = self.cm.get_extrinsic(cam_id)                 
         w_img, h_img = self._img_size(cam_id)
 
-        R = Ext[:, :3].astype(np.float32)                   # (3,3)
-        t = Ext[:, 3].astype(np.float32).reshape(3, 1)      # (3,1)
+        R = Ext[:, :3].astype(np.float32)                   
+        t = Ext[:, 3].astype(np.float32).reshape(3, 1)      
 
         cx = float(obj3d.position.x)
         cy = float(obj3d.position.y)
@@ -183,11 +183,11 @@ class MultiCamProjector:
         if sx <= 1e-3 or sy <= 1e-3 or sz <= 1e-3:
             return None
 
-        corners_ouster = compute_3d_bbox_corners_centered(cx, cy, cz, yaw, sx, sy, sz)  # (8,3)
+        corners_ouster = compute_3d_bbox_corners_centered(cx, cy, cz, yaw, sx, sy, sz)
 
-        X = corners_ouster.T.astype(np.float32)   # (3,8)
-        corners_cam = (R @ X) + t                 # (3,8)
-        corners_cam = corners_cam.T               # (8,3)
+        X = corners_ouster.T.astype(np.float32)   
+        corners_cam = (R @ X) + t                 
+        corners_cam = corners_cam.T               
 
         if np.all(corners_cam[:, 2] <= 1e-6):
             return None
@@ -264,7 +264,7 @@ class SensorFusion:
     def __init__(
         self,
         projector: MultiCamProjector,
-        score_fn: str = "sdiou",   # "iou" or "sdiou"
+        score_fn: str = "iou",   # "iou" or "sdiou"
         threshold: float = 0.4,
         resolve_global_unique_lidar: bool = True,
     ):
@@ -298,15 +298,8 @@ class SensorFusion:
                 continue
             for di, db in enumerate(det_boxes):
                 score_mat[li, di] = self._score(proj, db)
-        #logging
-        #all_scores = score_mat[score_mat > 0]
-        #logger.info(f"[fusion cam={cam_id}] nL={nL} nD={nD} score_fn={self.score_fn} " f"score_mat {_stats(all_scores)} thresh={self.threshold:.2f}")
-        #logging  done
+
         row, col = linear_sum_assignment(-score_mat)  # maximize score
-        #logging
-        #assigned_scores = np.array([score_mat[r, c] for r, c in zip(row, col)], dtype=float)
-        #logger.info(f"[fusion cam={cam_id}] hungarian_pairs={len(row)} assigned_scores {_stats(assigned_scores)}")
-        #logging  done
         matches: List[Tuple[int, int, float]] = []
         used_l = set()
         used_d = set()
@@ -317,13 +310,7 @@ class SensorFusion:
                 matches.append((int(r), int(c), s))
                 used_l.add(int(r))
                 used_d.add(int(c))
-        
-        #logging
-        #kept_scores = np.array([s for (_, _, s) in matches], dtype=float)
-        #dropped_scores = assigned_scores[assigned_scores < self.threshold] if assigned_scores.size else np.array([])
-        #logger.info(f"[fusion cam={cam_id}] kept={len(matches)}/{len(row)} kept_scores {_stats(kept_scores)} "
-        #            f"dropped_scores {_stats(dropped_scores)}")
-        #logging done
+    
 
         unmatched_lidar = [i for i in range(nL) if i not in used_l]
         unmatched_cam = [j for j in range(nD) if j not in used_d]
@@ -339,21 +326,11 @@ class SensorFusion:
         lidar_objects = list(lidar_list.objects_3d) 
         assoc_debug: Dict[int, CamAssocResult] = {}
 
-        # 1) per-camera Hungarian => candidates
-        # candidates: (proj_area, score, cam_id, lidar_idx, det_idx, proj_box_xyxy)
         candidates: List[Tuple[float, float, int, int, int, Tuple[float, float, float, float]]] = []
 
         for cam_id, det_list in yolo_by_cam.items():
             res = self.associate_one_camera(lidar_objects, det_list)
             assoc_debug[int(cam_id)] = res
-
-            #for (li, di, s) in res.matches:
-                # recompute projected bbox once so we can use its AREA for global selection
-            #    proj = self.projector.project_object_to_xyxy(lidar_objects[li], int(cam_id))
-            #    if proj is None:
-            #        continue
-            #    area = box_area_xyxy(proj)
-            #    candidates.append((float(area), float(s), int(cam_id), int(li), int(di), proj))
 
             det_boxes = [xywh_to_xyxy(d.x, d.y, d.w, d.h) for d in det_list.detections]
 
@@ -371,13 +348,9 @@ class SensorFusion:
                     proj, det_xyxy
                 ))
 
-        # 2) resolve: each LiDAR object matched at most once across all cameras
         chosen: List[Tuple[int, int, int, float]] = []  # (cam_id, lidar_idx, det_idx, score)
 
         if self.resolve_global_unique_lidar:
-            # Sort by:
-            #   1) projected 3D bbox area (descending)  <-- "choose cam where projected 3D area is largest"
-            #   2) match score IoU/SDIoU (descending)   <-- tie-breaker
             candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
 
             used_lidar = set()
@@ -392,7 +365,6 @@ class SensorFusion:
                 used_lidar.add(li)
                 used_det.add((cam_id, di))
         else:
-            # keep all matches (can lead to one LiDAR object taking multiple classes across cams)
             chosen = [(cam_id, li, di, s) for (area, s, cam_id, li, di, _proj, _det_xyxy) in candidates]
 
         fusion_meta: Dict[int, Dict[str, Any]] = {}
@@ -421,7 +393,7 @@ class SensorFusion:
                 "det_score": float(getattr(det, "score", 0.0) or 0.0),
             }
 
-        # 3) semantic fusion update
+
         for cam_id, li, di, s in chosen:
             det_list = yolo_by_cam[cam_id]
             det = det_list.detections[di]

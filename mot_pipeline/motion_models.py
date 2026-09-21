@@ -16,16 +16,13 @@ def CV3D() -> KalmanFilter:
     State x:
       [x, y, z, yaw, l, w, h, vx, vy, vz]
     """
-    # [x,y,z,yaw,l,w,h,vx,vy,vz]
     kf = KalmanFilter(dim_x=10, dim_z=7)
 
-    # F (dt injected later)
     kf.F = np.eye(10, dtype=float)
     kf.F[0, 7] = 1.0
     kf.F[1, 8] = 1.0
     kf.F[2, 9] = 1.0
 
-    # H maps to measured components [x,y,z,yaw,l,w,h]
     kf.H = np.zeros((7, 10), dtype=float)
     kf.H[0, 0] = 1.0
     kf.H[1, 1] = 1.0
@@ -35,22 +32,47 @@ def CV3D() -> KalmanFilter:
     kf.H[5, 5] = 1.0
     kf.H[6, 6] = 1.0
 
-    # P: high uncertainty on velocities
     kf.P = np.eye(10, dtype=float)
-    kf.P[0:3, 0:3] *= 4.0     # x,y,z:   σ = 2.0 m
-    kf.P[3,   3]   *= 0.25    # yaw:      σ = 0.5 rad
-    kf.P[4:7, 4:7] *= 0.25    # l,w,h:    σ = 0.5 m
+    kf.P[0:3, 0:3] *= 4.0     
+    kf.P[3,   3]   *= 0.25    
+    kf.P[4:7, 4:7] *= 0.25
     kf.P[7:,  7:]  *= 25.0
-    #kf.P *= 10.0
-    #kf.P[7:, 7:] *= 1000.0
 
     # Q
     kf.Q = np.eye(10, dtype=float)
     kf.Q[0:7, 0:7] *= 0.01
     kf.Q[7:, 7:] *= 0.01
 
-    # R: measurement noise
-    kf.R = np.eye(7, dtype=float) * 0.01
+    #r_current
+    kf.R = np.diag([
+        0.10, 0.10, 0.20,   # x, y, z
+        0.30,               # yaw
+        0.20, 0.20, 0.30    # l, w, h
+    ])
+    #r_very_loose
+    # kf.R = np.diag([
+    #     1.50, 1.50, 2.0,   # x, y, z
+    #     2.00,               # yaw
+    #     1.50, 1.50, 1.50    # l, w, h
+    # ])
+    #r_tight
+    # kf.R = np.diag([
+    #     0.05, 0.05, 0.10,   # x, y, z
+    #     0.15,               # yaw
+    #     0.10, 0.10, 0.15    # l, w, h
+    # ])
+    #r_medium
+    # kf.R = np.diag([
+    #     0.4, 0.4, 0.50,   # x, y, z
+    #     0.6,               # yaw
+    #     0.40, 0.40, 0.5    # l, w, h
+    # ])
+    # #r_loose
+    # kf.R = np.diag([
+    #     0.6, 0.6, 0.70,   # x, y, z
+    #     1.0,               # yaw
+    #     0.70, 0.70, 0.8    # l, w, h
+    # ])
 
     kf.model_name = "CV3D"
     kf.state_dim = 10
@@ -59,20 +81,10 @@ def CV3D() -> KalmanFilter:
     return kf
 
 def set_kf_dt(kf: KalmanFilter, dt: float) -> None:
-    """
-    Overwrite the dt-dependent entries in F before predict().
-
-    - CV (dim_x=10):
-        x <- x + vx*dt
-    - CA (dim_x=13):
-        x <- x + vx*dt + 0.5*ax*dt^2
-        vx <- vx + ax*dt
-    """
     dt = float(max(1e-3, dt))
     dim_x = int(kf.dim_x)
 
     if dim_x == 10:
-        # reset to identity then inject dt
         kf.F[:] = np.eye(10, dtype=float)
         kf.F[0, 7] = dt
         kf.F[1, 8] = dt
@@ -82,18 +94,15 @@ def set_kf_dt(kf: KalmanFilter, dt: float) -> None:
     if dim_x == 13:
         kf.F[:] = np.eye(13, dtype=float)
 
-        # position <- velocity
         kf.F[0, 7] = dt
         kf.F[1, 8] = dt
         kf.F[2, 9] = dt
 
-        # position <- acceleration (0.5*dt^2)
         dt2 = dt * dt
         kf.F[0, 10] = 0.5 * dt2
         kf.F[1, 11] = 0.5 * dt2
         kf.F[2, 12] = 0.5 * dt2
 
-        # velocity <- acceleration (dt)
         kf.F[7, 10] = dt
         kf.F[8, 11] = dt
         kf.F[9, 12] = dt
@@ -102,24 +111,16 @@ def set_kf_dt(kf: KalmanFilter, dt: float) -> None:
     raise ValueError(f"Unsupported KF dim_x={dim_x} in set_kf_dt()")
 
 def set_kf_q(kf: KalmanFilter, dt: float,
-             # CV: acceleration noise (m/s^2)
-             sigma_ax: float = 3.0,
-             sigma_ay: float = 3.0,
-             sigma_az: float = 1.5,
-             # CA: jerk noise (m/s^3)
-             sigma_jx: float = 6.0,
-             sigma_jy: float = 6.0,
-             sigma_jz: float = 3.0,
-             # random walks
-             sigma_yaw: float = 0.3,   # rad/sqrt(s)
-             sigma_size: float = 0.5   # m/sqrt(s)
+             sigma_ax: float = 4.0,
+             sigma_ay: float = 4.0,
+             sigma_az: float = 0.8,
+             sigma_jx: float = 2.0,
+             sigma_jy: float = 2.0,
+             sigma_jz: float = 0.5,
+             sigma_yaw: float = 0.2,   # rad/sqrt(s)
+             sigma_size: float = 0.3  # m/sqrt(s)
              ) -> None:
-    
-    #Set dt-consistent process noise Q depending on KF dimension.
-    #- CV (10D): white-noise acceleration on x/y/z for (pos, vel)
-    #- CA (13D): white-noise jerk on x/y/z for (pos, vel, acc)
-    #yaw + size are modeled as random walks.
-    
+
     dt = float(max(1e-3, dt))
     dim_x = int(kf.dim_x)
 
@@ -135,17 +136,10 @@ def set_kf_q(kf: KalmanFilter, dt: float,
                 [dt3/2.0, dt2]
             ], dtype=float)
 
-        # (x,vx) -> indices (0,7)
         Q[np.ix_([0,7],[0,7])] = q_cv_1d(sigma_ax)
-        # (y,vy) -> (1,8)
         Q[np.ix_([1,8],[1,8])] = q_cv_1d(sigma_ay)
-        # (z,vz) -> (2,9)
         Q[np.ix_([2,9],[2,9])] = q_cv_1d(sigma_az)
-
-        # yaw random walk
         Q[3,3] = (sigma_yaw**2) * dt
-
-        # l,w,h random walk
         Q[4,4] = (sigma_size**2) * dt
         Q[5,5] = (sigma_size**2) * dt
         Q[6,6] = (sigma_size**2) * dt
@@ -167,17 +161,10 @@ def set_kf_q(kf: KalmanFilter, dt: float,
                 [dt3/6.0,  dt2/2.0, dt]
             ], dtype=float)
 
-        # (x,vx,ax) -> (0,7,10)
         Q[np.ix_([0,7,10],[0,7,10])] = q_ca_1d(sigma_jx)
-        # (y,vy,ay) -> (1,8,11)
         Q[np.ix_([1,8,11],[1,8,11])] = q_ca_1d(sigma_jy)
-        # (z,vz,az) -> (2,9,12)
         Q[np.ix_([2,9,12],[2,9,12])] = q_ca_1d(sigma_jz)
-
-        # yaw random walk
         Q[3,3] = (sigma_yaw**2) * dt
-
-        # l,w,h random walk
         Q[4,4] = (sigma_size**2) * dt
         Q[5,5] = (sigma_size**2) * dt
         Q[6,6] = (sigma_size**2) * dt
@@ -197,34 +184,29 @@ def CA3D() -> KalmanFilter:
     """
 
     kf = KalmanFilter(dim_x=13, dim_z=7)
-
-    # State transition (dt injected later)
     kf.F = np.eye(13, dtype=float)
 
-    # Measurement model H
     kf.H = np.zeros((7, 13), dtype=float)
     for i in range(7):
         kf.H[i, i] = 1.0
 
-    # Initial covariance
     kf.P = np.eye(13, dtype=float)
-    kf.P[0:3, 0:3] *= 4.0     # x,y,z:   σ = 2.0 m
-    kf.P[3,   3]   *= 0.25    # yaw:      σ = 0.5 rad
-    kf.P[4:7, 4:7] *= 0.25    # l,w,h:    σ = 0.5 m
-    kf.P[7:10, 7:10] *= 25.0  # vx,vy,vz: σ = 5.0 m/s
+    kf.P[0:3, 0:3] *= 4.0     
+    kf.P[3,   3]   *= 0.25    
+    kf.P[4:7, 4:7] *= 0.25    
+    kf.P[7:10, 7:10] *= 25.0  
     kf.P[10:13,10:13]*= 9.0
-    #kf.P *= 10.0
-    #kf.P[7:10, 7:10] *= 1000.0   # velocity uncertainty
-    #kf.P[10:13, 10:13] *= 2000.0 # acceleration uncertainty
 
-    # Process noise Q
     kf.Q = np.eye(13, dtype=float)
-    kf.Q[0:7, 0:7] *= 0.01       # pose / size
-    kf.Q[7:10, 7:10] *= 0.1      # velocity
-    kf.Q[10:13, 10:13] *= 1.0    # acceleration
+    kf.Q[0:7, 0:7] *= 0.01       
+    kf.Q[7:10, 7:10] *= 0.1      
+    kf.Q[10:13, 10:13] *= 1.0    
 
-    # Measurement noise R (NO velocity here)
-    kf.R = np.eye(7, dtype=float) * 0.01
+    kf.R = np.diag([
+        0.10, 0.10, 0.20,   # x, y, z
+        0.30,               # yaw
+        0.20, 0.20, 0.30    # l, w, h
+    ])
 
     kf.model_name = "CA3D"
     kf.state_dim = 13

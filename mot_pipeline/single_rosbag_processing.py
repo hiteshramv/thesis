@@ -1,10 +1,8 @@
-#ros2 bag play "/home/vh17r/ros2_yolo/inani/inani__2026-02-27_12-34-02-937" --clock
-#ros2 bag play "/home/vh17r/ros2_yolo/inani/new" --clock
-
-
 import sys
 import os
 import time
+import csv
+from pathlib import Path
 from collections import defaultdict, deque
 import numpy as np
 import threading
@@ -20,8 +18,8 @@ from datastructures.image_detection import ImageDetection, ImageDetectionList
 from datastructures.PcdHelper import PcdHelper
 from datastructures.final_calibration_dict import calibration_data
 
-#from kalman_tracker import KalmanMultiObjectTracker
-from ekf_tracker import KalmanMultiObjectTracker
+from kalman_tracker import KalmanMultiObjectTracker
+#from ekf_tracker import KalmanMultiObjectTracker
 
 import rclpy
 from rclpy.node import Node
@@ -45,19 +43,16 @@ from helper_functions_lidar import choose_display_tracks_with_aliasing, cleanup_
 # =========================
 # CONFIGURATION
 # =========================
-#BAG_PATH = "/home/vh17r/ros2_yolo/inani/inani__2026-02-27_12-52-38-646"   #low volume pedestrians
-#BAG_PATH = "/home/vh17r/ros2_yolo/inani/inani__2026-02-27_12-34-02-937"  #low volume pedestrians
-#BAG_PATH = "/home/vh17r/ros2_yolo/inani/inani__2026-02-27_12-12-20-443" #high volume pedestrians
-#BAG_PATH = "/home/vh17r/ros2_yolo/inani/inani__2026-02-27_12-17-21-694"  #mid volume pedestrians
-#BAG_PATH = "/mnt/e/evualation/new9"
-#BAG_PATH = "/home/vh17r/ros2_yolo/inani/inani__2026-02-27_12-37-44-642"
-#BAG_PATH = "/home/vh17r/ros2_yolo/inani/inani__2026-02-27_12-45-30-329"
-BAG_PATH = "/home/vh17r/ros2_yolo/inani/inani__2026-02-27_13-01-05-418"
-#BAG_PATH = "/home/vh17r/ros2_yolo/inani/inani__2026-02-27_07-33-37-818/inani__2026-02-27_07-33-37-818__bag1"
 
+DEFAULT_BAG_PATH = "/home/vh17r/ros2_yolo/inani/evualation/new2/new2"
+
+BAG_PATH = os.environ.get("BAG_PATH", DEFAULT_BAG_PATH)
+
+SCENE_ID = os.environ.get("SCENE_ID", Path(BAG_PATH).parent.name)
+
+PRED_CSV = os.environ.get("PRED_CSV", str(Path(BAG_PATH).parent / "predictions.csv"))
 
 TOPIC_TRACKS = "/object_list/fused/tracked/processed"
-# TOPIC_TRACKS = "/inani_final_tracks"
 
 TOPIC_YOLO   = "/three_cam_yolov11s_inani_2d_detections"
 TOPIC_OUSTER = "/ouster/points"
@@ -81,7 +76,19 @@ TOPIC_TYPES = {
 CLASS_LIST = ["Background", "Adult", "Child", "Cyclist", "Motorcycle", "Car", "Van", "Truck", "Bus"]
 CLASS_VEHICLES = ["Car", "Van", "Bus", "Truck", "Motorcycle"]
 
+# Class-wise ROI configuration
+ROI_X_MIN, ROI_X_MAX = 0.0, 18.0
+ROI_NARROW_Y_MIN, ROI_NARROW_Y_MAX = -15.0, 15.0
+ROI_VEHICLE_Y_MIN, ROI_VEHICLE_Y_MAX = -35.0, 35.0
+
+# Motorcycle intentionally belongs to the narrower ROI.
+NARROW_ROI_CLASSES = {
+    "adult", "child", "pedestrian", "cyclist", "bicycle", "motorcycle"
+}
+WIDE_ROI_CLASSES = {"car", "van", "truck", "bus", "vehicle"}
+
 dome_extrinsic = np.array(calibration_data["lidars"]["dome"]["extrinsic"])
+
 
 def _get(obj, path, default=None):
     cur = obj
@@ -90,6 +97,25 @@ def _get(obj, path, default=None):
             return default
         cur = getattr(cur, p, None)
     return default if cur is None else cur
+
+
+def is_inside_class_roi(x: float, y: float, class_name: str) -> bool:
+    """Check an object's center against the requested class-wise ROI."""
+    x = float(x)
+    y = float(y)
+
+    if not (ROI_X_MIN <= x <= ROI_X_MAX):
+        return False
+
+    name = str(class_name).strip().lower()
+
+    if name in WIDE_ROI_CLASSES:
+        return ROI_VEHICLE_Y_MIN <= y <= ROI_VEHICLE_Y_MAX
+
+    if name in NARROW_ROI_CLASSES:
+        return ROI_NARROW_Y_MIN <= y <= ROI_NARROW_Y_MAX
+
+    return ROI_NARROW_Y_MIN <= y <= ROI_NARROW_Y_MAX
 
 
 def center_xyxy(box):
@@ -103,6 +129,7 @@ def draw_xyxy(img, box, color, label="", thickness=2):
     if label:
         cv2.putText(img, label, (x1, max(0, y1 - 5)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+
 
 def draw_mot_tracks_overlay(cv_img, cam_id, projector, tracks_out):
     """
@@ -151,14 +178,15 @@ def draw_assoc_overlay(cv_img, cam_id, projector, lidar_objs, det_list, assoc_re
 
     yolo_boxes = [xywh_to_xyxy(d.x, d.y, d.w, d.h) for d in det_list.detections]
     for j, (b, d) in enumerate(zip(yolo_boxes, det_list.detections)):
+        #if d.class_name in{}
         draw_xyxy(out, b, (0, 255, 0), label=f"Y{j}:{d.class_name}")
 
     lidar_boxes = []
     for i, obj in enumerate(lidar_objs):
         pb = projector.project_object_to_xyxy(obj, cam_id)
         lidar_boxes.append(pb)
-        if pb is not None:
-            draw_xyxy(out, pb, (255, 0, 0), label=f"LP{i}:{obj.class_name}:{obj.size.z:.3f}")
+        # if pb is not None:
+            # draw_xyxy(out, pb, (255, 0, 0), label=f"LP{i}:{obj.class_name}")
 
     for (li, di, s) in assoc_res.matches:
         lb = lidar_boxes[li]
@@ -167,15 +195,15 @@ def draw_assoc_overlay(cv_img, cam_id, projector, lidar_objs, det_list, assoc_re
         db = yolo_boxes[di]
         lc = center_xyxy(lb)
         dc = center_xyxy(db)
-        cv2.line(out, (int(lc[0]), int(lc[1])), (int(dc[0]), int(dc[1])), (0, 0, 255), 2)
-        cv2.putText(out, f"{s:.2f}", (int(dc[0]), int(dc[1])),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2, cv2.LINE_AA)
+        #cv2.line(out, (int(lc[0]), int(lc[1])), (int(dc[0]), int(dc[1])), (0, 0, 255), 2)
+        #cv2.putText(out, f"m", (int(dc[0]), int(dc[1])), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2, cv2.LINE_AA)
 
     cv2.putText(out,
-                f"cam{cam_id}  matches={len(assoc_res.matches)}  "
-                f"uL={len(assoc_res.unmatched_lidar)}  uC={len(assoc_res.unmatched_cam)}",
-                (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+                f"cam{cam_id}" , #matches={len(assoc_res.matches)}  "
+                #f"uL={len(assoc_res.unmatched_lidar)}  uC={len(assoc_res.unmatched_cam)}",
+                (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 2, cv2.LINE_AA)
     return out
+
 
 def make_box_corners(cx, cy, cz, l, w, h, yaw):
     hx, hy, hz = l / 2.0, w / 2.0, h / 2.0
@@ -220,45 +248,50 @@ class DualBagProcessor(Node):
     def __init__(self):
         super().__init__("dual_bag_processor")
         self.processed_frame_count = 0
-        self.ENABLE_MERGE = False
+        self.ENABLE_MERGE = True
 
         self.pcd_helper = PcdHelper()
         self.msg_buffer = defaultdict(dict)
 
-        self.x_min, self.x_max = -0.5, 24.0
-        self.y_min, self.y_max = -20.0, 20.0
+        self.x_min, self.x_max = ROI_X_MIN, ROI_X_MAX
+        self.y_min, self.y_max = ROI_NARROW_Y_MIN, ROI_NARROW_Y_MAX
+
+        # Evaluation export
+        self.scene_id = SCENE_ID
+        self.pred_csv = Path(PRED_CSV)
+        self._init_prediction_csv()
 
         # visualization
         self.bridge = CvBridge()
         self.enable_viz = True
         self.viz_every_n = 1
-        self.img_slop = 0.08
+        self.img_slop = 0.09
 
         # SAVE IMAGES
         self.save_viz = False
         self.save_every_n = 1
-        self.save_dir = os.path.join(os.path.dirname(__file__), "saved_viz_tracks")
+        self.save_dir = os.path.join(os.path.dirname(__file__), "saved_viz_tracks_latest")
         os.makedirs(self.save_dir, exist_ok=True)
 
         # STEP MODE
         self.step_mode = True
-        self.step_window_name = "3 Cam Assoc Overlay"
+        self.step_window_name = "Camera View"
 
         self.pub_merged_cloud = self.create_publisher(PointCloud2, "/inani_combined_points", 10)
 
         # projector + fusion
         self.projector = MultiCamProjector(calibration_data)
-        self.fusion = SensorFusion(self.projector, score_fn="iou", threshold=0.2, resolve_global_unique_lidar=True)
+        self.fusion = SensorFusion(self.projector, score_fn="iou", threshold=0.2, resolve_global_unique_lidar=True) #threshold = 0.2/0.4
 
         self.mot = KalmanMultiObjectTracker(
-            #motion_model='ca',
-            motion_model='ctra',
-            max_age=7,
-            min_hits=3,
-            #dist3d_thresh=1.5, #gating(linear)
-            dist3d_thresh = 2,  #gating(nonlinear)
+            motion_model='cv',
+            #motion_model='ctra',
+            max_age=5,
+            min_hits=2,
+            dist3d_thresh=1.0,
             iou2d_thresh=0.4
         )
+
 
         self._group_parent = {}
         self._group_last_seen: Dict[int, int] = {}
@@ -268,6 +301,88 @@ class DualBagProcessor(Node):
         self.viz_only_recent = True
 
         self.get_logger().info("One-Bag Processor Initialized.")
+        self.get_logger().info(f"BAG_PATH: {BAG_PATH}")
+        self.get_logger().info(f"SCENE_ID: {self.scene_id}")
+        self.get_logger().info(f"Prediction CSV: {self.pred_csv}")
+
+    # ============================================================
+    # Evaluation CSV export
+    # ============================================================
+
+    def _init_prediction_csv(self):
+        """
+        Creates/overwrites one prediction CSV for this scene.
+
+        Output rows are final displayed tracks, one row per track per processed frame.
+        The evaluator will match label JSON timestamps to nearest timestamp_s.
+        """
+        self.pred_csv.parent.mkdir(parents=True, exist_ok=True)
+
+        with self.pred_csv.open("w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "scene_id",
+                "timestamp_s",
+                "frame_idx",
+                "track_id",
+                "class_name",
+                "x", "y", "z",
+                "l", "w", "h",
+                "yaw",
+                "hits",
+                "time_since_update",
+            ])
+
+    def _append_tracks_to_csv(self, timestamp_s, tracks):
+        """
+        Append final tracks for one synchronized frame.
+
+        This uses the same basic visibility filters as publish_track_wireframes:
+          - valid state length
+          - recent track if viz_only_recent is enabled
+          - class-wise ROI filter using is_inside_class_roi()
+
+        If you want to evaluate raw tracker output instead, call this with tracks_out
+        instead of tracks_display in process_frame().
+        """
+        rows = []
+
+        for t in tracks:
+            st = getattr(t, "state", None)
+            if st is None or len(st) < 7:
+                continue
+
+            tsu = int(getattr(t, "time_since_update", 999))
+            if self.viz_only_recent and tsu >= 7:
+                continue
+
+            cx, cy, cz = float(st[0]), float(st[1]), float(st[2])
+            yaw = float(st[3])
+            l, w, h = float(st[4]), float(st[5]), float(st[6])
+
+            cls_name = str(getattr(t, "class_name", "unknown"))
+            if not is_inside_class_roi(cx, cy, cls_name):
+                continue
+
+            rows.append([
+                self.scene_id,
+                float(timestamp_s),
+                int(self.processed_frame_count),
+                int(getattr(t, "track_id")),
+                cls_name,
+                cx, cy, cz,
+                l, w, h,
+                yaw,
+                int(getattr(t, "hits", 0)),
+                tsu,
+            ])
+
+        if not rows:
+            return
+
+        with self.pred_csv.open("a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerows(rows)
 
     def create_reader(self, path, topics):
         storage_options = StorageOptions(uri=path, storage_id='sqlite3')
@@ -342,20 +457,19 @@ class DualBagProcessor(Node):
             z = float(zs[i]) - 2.9
             cname = _to_str(names[i]) if names is not None and i < len(names) else "Unknown"
 
-            if not (self.x_min <= x <= self.x_max):
+            if not (ROI_X_MIN <= x <= ROI_X_MAX):
                 continue
-            if not (self.y_min <= y <= self.y_max):
+            if not (ROI_VEHICLE_Y_MIN <= y <= ROI_VEHICLE_Y_MAX):
                 continue
 
-            if cname=="Pedestrian":
-                #print(f"{sz[i]}")
-                if sz[i]<=1.4:
+            if cname.strip().lower() == "pedestrian":
+                if float(sz[i]) <= 1.5:
                     cname = "Child"
                 else:
                     cname = "Adult"
 
-            #if cname in CLASS_VEHICLES:
-            #    continue
+            if cname in CLASS_VEHICLES:
+                continue
 
             size = Size3d(x=float(sx[i]), y=float(sy[i]), z=float(sz[i]))
             position = Position3d(x=x, y=y, z=z)
@@ -382,9 +496,14 @@ class DualBagProcessor(Node):
 
             for box in cam_obj.boxes:
                 cid = box.class_id
+                if box.score < 0.58:
+                    continue
+
                 cname = CLASS_LIST[cid] if 0 <= cid < len(CLASS_LIST) else "Unknown"
-                #if cname in {"Adult", "Child"}:
-                #    cname = "Pedestrian"
+                if cname in {"Adult", "Child"}:
+                    cname = "Pedestrian"
+                # if cname in CLASS_VEHICLES:
+                #    continue
 
                 custom_det = ImageDetection(
                     x=box.center_x,
@@ -423,24 +542,17 @@ class DualBagProcessor(Node):
             hits = int(getattr(t, "hits", 0))
             tsu = int(getattr(t, "time_since_update", 999))
 
-            # if self.viz_only_confirmed and hits < self.mot.min_hits:
-            #     continue
-
-            if self.viz_only_recent and tsu >= 4:
+            if self.viz_only_recent and tsu >= 7:
                 continue
 
             cx, cy, cz = float(st[0]), float(st[1]), float(st[2])
             yaw = float(st[3])
             l, w, h = float(st[4]), float(st[5]), float(st[6])
 
-            if not (self.x_min <= cx <= self.x_max):
-                continue
-            if not (self.y_min <= cy <= self.y_max):
+            cls_name = str(getattr(t, "class_name", "unknown"))
+            if not is_inside_class_roi(cx, cy, cls_name):
                 continue
 
-
-            # get class name from track if available
-            cls_name = getattr(t, "class_name", "unknown")
             color = class_color(cls_name)
 
             corners = make_box_corners(cx, cy, cz, l, w, h, yaw)
@@ -454,9 +566,9 @@ class DualBagProcessor(Node):
             m.type = Marker.LINE_LIST
             m.action = Marker.ADD
             m.pose.orientation.w = 1.0
-            m.scale.x = 0.1
+            m.scale.x = 0.05
             m.color = color
-            #m.color = ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0)
+            # m.color = ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0)
 
             m.points = []
             for p in line_pts:
@@ -471,13 +583,15 @@ class DualBagProcessor(Node):
             txt.id = 100000 + m.id
             txt.type = Marker.TEXT_VIEW_FACING
             txt.action = Marker.ADD
-            txt.pose.position.x = cx
+            txt.pose.position.x = cx + 0.5
             txt.pose.position.y = cy
             txt.pose.position.z = cz + h / 2.0 + 0.3
             txt.pose.orientation.w = 1.0
-            txt.scale.z = 0.6
+            txt.scale.z = 0.5
             txt.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
-            txt.text = f"ID:{getattr(t, 'track_id', idx)}"
+            txt.text = f"{cls_name}"
+            # txt.text = f"{getattr(t, 'track_id', idx)}"
+            #txt.text = f"ID:{getattr(t, 'track_id', idx)}"
             ma.markers.append(txt)
 
         self.pub_markers.publish(ma)
@@ -533,33 +647,27 @@ class DualBagProcessor(Node):
                 fusion_meta=fusion_meta
             )
 
-            #tracks_out = suppress_duplicate_tracks_3d(tracks_out, iou_thr=0.1)
+            # tracks_out = suppress_duplicate_tracks_3d(tracks_out, iou_thr=0.1)
             alive_ids = [t.track_id for t in tracks_out]
-            # tracks_display = choose_display_tracks_with_aliasing(
-            #     tracks_out=tracks_out,
-            #     group_parent=self._group_parent,
-            #     group_last_seen=self._group_last_seen,
-            #     frame_id=self.processed_frame_count,
-            #     group_ttl=15,
-            #     iou_thr=0.4,
-            # )
+
             tracks_display = choose_display_tracks_with_aliasing(
-               tracks_out=tracks_out,
-               group_parent=self._group_parent,
-               iou_thr=0.8,           # tune dense scene 0.8, or 0.4
+                tracks_out=tracks_out,
+                group_parent=self._group_parent,
+                iou_thr=0.7,  # tune dense scene 0.8, or 0.4
             )
 
-            # publish only the display tracks
+            # Export the same display tracks that are published/visualized.
+            self._append_tracks_to_csv(ts_float, tracks_display)
+
+            # Publish only the display tracks.
+            #self.publish_track_wireframes(tracks_out, frame_id="sys_world")
             self.publish_track_wireframes(tracks_display, frame_id="sys_world")
 
-            #cleanup_group_parent(self._group_parent, [t.track_id for t in tracks_out])
-            #cleanup_group_parent(self._group_parent, alive_ids)
-            #self.publish_track_wireframes(tracks_out, frame_id="sys_world")
 
             if self.processed_frame_count % 20 == 0:
                 cleanup_group_parent(self._group_parent, alive_ids)
                 ids = [t.track_id for t in tracks_out[:10]]
-                print(f"[MOT] num_tracks={len(tracks_out)}") # sample_ids={ids}
+                print(f"[MOT] num_tracks={len(tracks_out)}")  # sample_ids={ids}
 
             if self.enable_viz and (self.processed_frame_count % self.viz_every_n == 0):
                 lidar_objs = custom_tracks.objects_3d
@@ -569,6 +677,7 @@ class DualBagProcessor(Node):
                     cv2.putText(panel, text, (30, 80),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2, cv2.LINE_AA)
                     return panel
+
 
                 def prep_panel(cam_msg, cam_id):
                     if cam_msg is None:
@@ -592,10 +701,38 @@ class DualBagProcessor(Node):
                 out2 = prep_panel(cam2_msg, 2)
                 out3 = prep_panel(cam3_msg, 3)
 
-                H = 540
+                H = 480 #540
 
                 def resize_to_h(img):
                     return cv2.resize(img, (int(img.shape[1] * H / img.shape[0]), H))
+
+                def resize_to_w(img, target_width = 960):
+                    """
+                    Resize an image to the target width while preserving its
+                    original aspect ratio.
+                    """
+                    if img is None or img.size == 0:
+                        return make_blank_panel(
+                            "INVALID IMAGE",
+                            width=target_width,
+                        )
+
+                    original_height, original_width = img.shape[:2]
+
+                    if original_width <= 0 or original_height <= 0:
+                        return make_blank_panel(
+                            "INVALID IMAGE SIZE",
+                            width=target_width,
+                        )
+
+                    scale = target_width / float(original_width)
+                    target_height = max(1, int(round(original_height * scale)))
+
+                    return cv2.resize(
+                        img,
+                        (target_width, target_height),
+                        interpolation=cv2.INTER_AREA,
+                    )
 
                 out1 = resize_to_h(out1)
                 out2 = resize_to_h(out2)
@@ -714,6 +851,8 @@ class DualBagProcessor(Node):
             buffers[TOPIC_YOLO].popleft()
 
         self.get_logger().info(f"Finished. Total Frames Processed: {self.processed_frame_count}")
+        self.get_logger().info(f"Prediction CSV written to: {self.pred_csv}")
+
 
 
 def main(args=None):
@@ -723,13 +862,19 @@ def main(args=None):
     exec_ = SingleThreadedExecutor()
     exec_.add_node(node)
 
-    worker = threading.Thread(target=node.run, daemon=True)
+    worker = threading.Thread(target=node.run)
     worker.start()
 
     try:
-        exec_.spin()
+        # Spin only while node.run() is still processing the bag
+        while worker.is_alive() and rclpy.ok():
+            exec_.spin_once(timeout_sec=2)
+
+        worker.join()
+
     except KeyboardInterrupt:
         pass
+
     finally:
         exec_.shutdown()
         cv2.destroyAllWindows()

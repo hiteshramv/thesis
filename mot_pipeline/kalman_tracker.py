@@ -1,7 +1,3 @@
-# Two-stage MOT:
-#   Stage-1: 3D association using 3D IoU
-#   Stage-2: 2D association for unmatched tracks using 2D IoU per camera
-
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Mapping
 from collections import defaultdict
@@ -58,7 +54,7 @@ def area_xyxy(bb: Tuple[float, float, float, float]) -> float:
 
 
 # ============================================================
-# Geometry: 3D IoU (oriented BEV + height overlap)
+# Geometry: 3D IoU
 # ============================================================
 
 def _rect_corners_bev(cx: float, cy: float, l: float, w: float, yaw: float) -> np.ndarray:
@@ -78,25 +74,17 @@ def _rect_corners_bev(cx: float, cy: float, l: float, w: float, yaw: float) -> n
 def _bev_intersection_area(boxA: Tuple[float, float, float, float, float],
                            boxB: Tuple[float, float, float, float, float]) -> float:
     
-    #box = (cx, cy, l, w, yaw)
-    
     ax, ay, al, aw, ayaw = boxA
     bx, by, bl, bw, byaw = boxB
-    #rc1 = _rect_corners_bev(ax, ay, al, aw, ayaw)
-    #rc2 = _rect_corners_bev(bx, by, bl, bw, byaw)
-    #ax1, ay1, ax2, ay2 = rc1[0,0] , rc1[1,0] , rc1[0,1], rc1[1,1]
-    #bx1, by1, bx2, by2 = rc2[0,0] , rc2[1,0] , rc2[0,1], rc2[1,1]
     ax1, ay1, ax2, ay2 = ax - al/2.0, ay - aw/2.0, ax + al/2.0, ay + aw/2.0
     bx1, by1, bx2, by2 = bx - bl/2.0, by - bw/2.0, bx + bl/2.0, by + bw/2.0
     ix1, iy1 = max(ax1, bx1), max(ay1, by1)
     ix2, iy2 = min(ax2, bx2), min(ay2, by2)
     return float(max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1))
 
-"""
+
 def scaled_dist(a: Dict[str, Any], b: Dict[str, Any]) -> float:
     
-    #d = ||rho_a - rho_b|| * (2 - cos(angle_diff))
-    #rho = [x, y, z, h, w, l]
     
     ax, ay, az = map(float, a["center_xyz"])
     al, aw, ah = map(float, a["dims_lwh"])
@@ -106,79 +94,19 @@ def scaled_dist(a: Dict[str, Any], b: Dict[str, Any]) -> float:
     bl, bw, bh = map(float, b["dims_lwh"])
     byaw = float(b["yaw"])
 
-    # Euclidean distance on [x,y,z,h,w,l]
     rho_a = np.array([ax, ay, az, ah, aw, al], dtype=np.float32)
     rho_b = np.array([bx, by, bz, bh, bw, bl], dtype=np.float32)
     dist = float(np.linalg.norm(rho_a - rho_b))
 
-    # angle diff with your existing robust yaw handling
     _, angle_diff = correct_new_angle_and_diff(ayaw, byaw)
 
     angle_diff = float(abs(angle_diff))
     if angle_diff > np.pi / 2:
         angle_diff = np.pi - angle_diff 
-
-    alpha = 2.0 - float(np.cos(angle_diff))  # in [1,2]
-    return dist * alpha
-"""
-
-def scaled_dist(a: Dict[str, Any], b: Dict[str, Any]) -> float:
-   
-    #Universal compromise cost for pedestrians, cyclists, and vehicles.
-
-    #Lower is better.
-
-    #a/b dict:
-    #  center_xyz: (x,y,z)
-    #  dims_lwh:   (l,w,h)
-    #  yaw:        radians
-    
-    ax, ay, az = map(float, a["center_xyz"])
-    al, aw, ah = map(float, a["dims_lwh"])
-    ayaw = float(a["yaw"])
-
-    bx, by, bz = map(float, b["center_xyz"])
-    bl, bw, bh = map(float, b["dims_lwh"])
-    byaw = float(b["yaw"])
-
-    # normalize by average box size
-    mean_l = max(0.5 * (al + bl), 1e-3)
-    mean_w = max(0.5 * (aw + bw), 1e-3)
-    mean_h = max(0.5 * (ah + bh), 1e-3)
-
-    # position deltas
-    dx = (ax - bx) / max(mean_l, 1.0)
-    dy = (ay - by) / max(mean_w, 1.0)
-    dz = (az - bz) / max(mean_h, 1.0)
-
-    # size deltas
-    dl = (al - bl) / mean_l
-    dw = (aw - bw) / mean_w
-    dh = (ah - bh) / mean_h
-
-    # compromise weights
-    # x,y strong; z medium; size weak
-    w_pos = np.array([1.0, 1.0, 0.4], dtype=np.float32)
-    w_size = np.array([0.3, 0.3, 0.1], dtype=np.float32)
-
-    pos_delta = np.array([dx, dy, dz], dtype=np.float32)
-    size_delta = np.array([dl, dw, dh], dtype=np.float32)
-
-    d_pos = float(np.sqrt(np.sum(w_pos * (pos_delta ** 2))))
-    d_size = float(np.sqrt(np.sum(w_size * (size_delta ** 2))))
-
-    base = d_pos + d_size
-
-    # very soft yaw penalty
-    _, angle_diff = correct_new_angle_and_diff(ayaw, byaw)
-    angle_diff = float(abs(angle_diff))
-    if angle_diff > np.pi / 2:
-        angle_diff = np.pi - angle_diff
-
     yaw_weight = 0.2
-    yaw_factor = 1.0 + yaw_weight * (1.0 - float(np.cos(angle_diff)))
+    alpha = 1.0 + yaw_weight*(1.0 - float(np.cos(angle_diff)))
+    return dist * alpha
 
-    return base * yaw_factor
 
 def iou3d_oriented(a: Dict[str, Any], b: Dict[str, Any]) -> float:
     """
@@ -229,10 +157,6 @@ def perform_association_from_similarity_hungarian(
     threshold: float = 0.0
 ) -> Tuple[np.ndarray, List[int], List[int]]:
     
-    #Hungarian assignment with hard gating.
-    #sim: similarity matrix (IoU), higher is better
-    #threshold: minimum similarity required for a valid match
-    
 
     if n_trks == 0:
         return np.empty((0, 2), dtype=int), list(range(n_dets)), []
@@ -240,8 +164,8 @@ def perform_association_from_similarity_hungarian(
         return np.empty((0, 2), dtype=int), [], list(range(n_trks))
 
     BIG = 1e6
-    cost = 1.0 - sim                 # maximize sim <=> minimize (1 - sim)
-    cost[sim < threshold] = BIG      # hard gate
+    cost = 1.0 - sim                 
+    cost[sim < threshold] = BIG
 
     row_ind, col_ind = linear_sum_assignment(cost)
 
@@ -261,10 +185,6 @@ def perform_association_from_similarity_hungarian(
 
 
 def greedy_match(cost_matrix: np.ndarray) -> np.ndarray:
-    
-    #Greedy one-to-one matching choosing smallest cost first.
-    #cost_matrix shape: (n_dets, n_trks)
-    #returns matched indices array shape (K,2) [det_i, trk_i]
     
     if cost_matrix.size == 0:
         return np.empty((0, 2), dtype=int)
@@ -338,15 +258,9 @@ class Track:
         self.time_since_2d_update = 0
         self.class_name = getattr(obj3d, "class_name", "unknown")
         self.last_ts = float(ts)
-
-        # FilterPy KF (10D state, 7D measurement)
         self.kf = make_kf(motion_model)
-
         z = self._obj3d_to_z7(obj3d)
         self.kf.x[:7] = z.reshape(7, 1)
-
-
-        # per-camera 2D cache (stage-2 update + fallback)
         self.last_bbox2d_by_cam: Dict[int, Tuple[float, float, float, float]] = {}
         self._pred_bbox2d_cache: Dict[int, Optional[Tuple[float, float, float, float]]] = {}
 
@@ -411,10 +325,8 @@ class Track:
         if cam_id in self._pred_bbox2d_cache:
             return self._pred_bbox2d_cache[cam_id]
 
-        # Prefer last known 2D if present
         best = self.last_bbox2d_by_cam.get(cam_id, None)
 
-        # Try project current 3D box into this camera
         try:
             obj3d_like = self._make_obj3d_like_for_projector()
             proj = projector.project_object_to_xyxy(obj3d_like, cam_id)
@@ -427,8 +339,7 @@ class Track:
         return best
 
     def _make_obj3d_like_for_projector(self) -> Any:
-        # Minimal object matching your projector expectations:
-        #  obj.position.x/y/z , obj.size.x/y/z , obj.yaw_angle
+
         class _Vec:
             def __init__(self, x, y, z):
                 self.x, self.y, self.z = x, y, z
@@ -447,7 +358,7 @@ class Track:
 
     @staticmethod
     def _obj3d_to_z7(obj3d: Any) -> np.ndarray:
-        # [x, y, z, yaw, l, w, h]
+    
         yaw = float(getattr(obj3d, "yaw_angle", 0.0)) if getattr(obj3d, "yaw_angle", None) is not None else 0.0
         return np.array([
             float(obj3d.position.x),
@@ -458,27 +369,6 @@ class Track:
             float(obj3d.size.y),
             float(obj3d.size.z),
         ], dtype=np.float32)
-
-"""
-    @staticmethod
-    def _obj3d_to_z10(obj3d: Any) -> np.ndarray:
-        # [x, y, z, yaw, l, w, h, vx, vy, vz]
-        yaw = float(getattr(obj3d, "yaw_angle", 0.0) or 0.0)
-        vx = float(obj3d.speed.vx) if getattr(obj3d, "speed", None) is not None else 0.0
-        vy = float(obj3d.speed.vy) if getattr(obj3d, "speed", None) is not None else 0.0
-        vz = float(obj3d.speed.vz) if getattr(obj3d, "speed", None) is not None else 0.0
-
-        return np.array([
-            float(obj3d.position.x),
-            float(obj3d.position.y),
-            float(obj3d.position.z),
-            yaw,
-            float(obj3d.size.x),
-            float(obj3d.size.y),
-            float(obj3d.size.z),
-            vx, vy, vz
-        ], dtype=np.float32)
-"""
 
 # ============================================================
 # Two-stage Track Manager
@@ -511,7 +401,6 @@ class KalmanMultiObjectTracker:
         self.tracks: List[Track] = []
         self.frame_count = 0
 
-    # ---------- adapters for Object3d -> boxdict ----------
 
     @staticmethod
     def _obj3d_to_boxdict(obj3d: Any) -> Dict[str, Any]:
@@ -522,7 +411,6 @@ class KalmanMultiObjectTracker:
             "yaw": yaw,
         }
 
-    # ---------- 2D detection -> xyxy ----------
 
     @staticmethod
     def _imdet_to_xyxy(det: Any) -> Optional[Tuple[float, float, float, float]]:
@@ -553,7 +441,6 @@ class KalmanMultiObjectTracker:
 
         return None
 
-    # ---------- main update ----------
     def update_two_stage(self,
                         dets3d: List[Any],
                         yolo_by_cam: Dict[int, Any],
@@ -592,12 +479,7 @@ class KalmanMultiObjectTracker:
                 cost3d[di, ti] = float(scaled_dist(det_boxes[di], track_boxes[ti]))
 
         vals = cost3d[np.isfinite(cost3d)]
-        #logger.info(
-        #    f"[mot3d frame={self.frame_count}] tracks={T} dets={D} cost3d {_stats(vals)} "
-        #    f"dist3d_thresh={self.dist3d_thresh:.2f}"
-        #)
 
-        # Hungarian min-cost with hard gating
         BIG = 1e6
         cost_for_hungarian = cost3d.copy()
         cost_for_hungarian[cost3d > self.dist3d_thresh] = BIG
@@ -614,45 +496,6 @@ class KalmanMultiObjectTracker:
         u_det = [i for i in range(D) if i not in matched[:, 0]] if len(matched) else list(range(D))
         u_trk = [j for j in range(T) if j not in matched[:, 1]] if len(matched) else list(range(T))
 
-        #post_costs = np.array([cost3d[int(di), int(ti)] for di, ti in matched], dtype=float)
-        #logger.info(
-        #    f"[mot3d frame={self.frame_count}] matches={len(matched)} costs {_stats(post_costs)} "
-        #    f"u_det={len(u_det)} u_trk={len(u_trk)}"
-        #)
-        """
-        # ----------------------------------------------------
-        # Stage-1: 3D IoU association
-        # ----------------------------------------------------
-        track_boxes = [trk.predicted_box3d_dict() for trk in self.tracks]
-        det_boxes = [self._obj3d_to_boxdict(obj) for obj in dets3d]
-
-        T, D = len(track_boxes), len(det_boxes)
-        sim3d = np.zeros((D, T), dtype=np.float32)  # (dets, tracks)
-        for di in range(D):
-            for ti in range(T):
-                sim3d[di, ti] = float(iou3d_oriented(det_boxes[di], track_boxes[ti]))
-
-        vals = sim3d[sim3d > 0]
-        logger.info(f"[mot3d frame={self.frame_count}] tracks={T} dets={D} sim3d {_stats(vals)} "
-                    f"dist3d_thresh={self.dist3d_thresh:.2f}")
-        best_det = sim3d.max(axis=1) if sim3d.size else np.array([])
-        best_trk = sim3d.max(axis=0) if sim3d.size else np.array([])
-
-        logger.info(f"[mot3d frame={self.frame_count}] best_per_det {_stats(best_det)}")
-        logger.info(f"[mot3d frame={self.frame_count}] best_per_trk {_stats(best_trk)}")
-        #used for greedy
-        matched, u_det, u_trk = perform_association_from_similarity(D, T, sim3d)
-        matched, u_det, u_trk = filter_matches(matched, u_det, u_trk, sim3d, self.dist3d_thresh)
-
-
-        #used for hungarian    
-        #matched, u_det, u_trk = perform_association_from_similarity_hungarian(D, T, sim3d, threshold=self.dist3d_thresh)
-
-        post_scores = np.array([sim3d[int(di), int(ti)] for di, ti in matched], dtype=float)
-        logger.info(f"[mot3d frame={self.frame_count}] post_filter matches={len(matched)} scores {_stats(post_scores)} "
-                    f"u_det={len(u_det)} u_trk={len(u_trk)}")
-        """
-        # apply 3D updates
         for di, ti in matched:
             di = int(di)
             ti = int(ti)
@@ -666,24 +509,15 @@ class KalmanMultiObjectTracker:
                     det_xyxy = meta["det_xyxy"]
                     self.tracks[ti].update_with_2d(cam_id, det_xyxy)
 
-
-        # leftover tracks after stage-1
         leftover_track_indices = list(u_trk)
 
         # ----------------------------------------------------
-        # Stage-2: 2D IoU association (multi-cam)
-        # - build 2D-only detection lists from fusion output
-        # - match per camera, collect candidate matches per track
-        # - choose best cam by largest projected 3D area
+        # Stage-2: 2D IoU association
         # ----------------------------------------------------
         logger2 = logging.getLogger("mot2d")
-        # candidate_matches maps local track index (in leftover list) -> list of (cam_id, det_local_index)
+
         candidate_matches: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
-
-        # for area heuristic, store track projection in each cam
         track_proj_xyxy_by_cam: Dict[Tuple[int, int], Tuple[float, float, float, float]] = {}
-
-        # build leftover track objects
         leftover_tracks = [self.tracks[i] for i in leftover_track_indices]
 
         for cam_id, res in assoc_debug.items():
@@ -694,12 +528,10 @@ class KalmanMultiObjectTracker:
 
             unmatched_cam = list(getattr(res, "unmatched_cam", []))
             if len(unmatched_cam) == 0 or len(leftover_tracks) == 0:
-                #logger2.info(f"[mot2d frame={self.frame_count} cam={cam_id}] skip: unmatched_cam={len(unmatched_cam)} leftover_tracks={len(leftover_tracks)}")
                 continue
 
-            # det boxes (2D-only)
             det_xyxys: List[Tuple[float, float, float, float]] = []
-            valid_det_map: List[int] = []  # local index -> original det index
+            valid_det_map: List[int] = []
             for idx in unmatched_cam:
                 det = det_list.detections[int(idx)]
                 xyxy = self._imdet_to_xyxy(det)
@@ -709,14 +541,8 @@ class KalmanMultiObjectTracker:
                 valid_det_map.append(int(idx))
 
             if len(det_xyxys) == 0:
-                #logger2.info(f"[mot2d frame={self.frame_count} cam={cam_id}] skip: no valid det boxes after _imdet_to_xyxy")
                 continue
-            #logger2.info(
-            #    f"[mot2d frame={self.frame_count} cam={cam_id}] "
-            #    f"unmatched_cam={len(unmatched_cam)} valid_det={len(det_xyxys)} "
-            #    f"leftover_tracks={len(leftover_tracks)}"
-            #)
-            # track boxes projected into this cam
+
             trk_xyxys: List[Tuple[float, float, float, float]] = []
             valid_trk_map: List[int] = []
             for local_ti, trk in enumerate(leftover_tracks):
@@ -728,14 +554,8 @@ class KalmanMultiObjectTracker:
                 track_proj_xyxy_by_cam[(local_ti, cam_id)] = proj
 
             if len(trk_xyxys) == 0:
-                #logger2.info(f"[mot2d frame={self.frame_count} cam={cam_id}] skip: no valid projected track boxes")
                 continue
-            #logger2.info(
-            #    f"[mot2d frame={self.frame_count} cam={cam_id}] "
-            #    f"trk_proj_valid={len(trk_xyxys)} iou2d_thresh={self.iou2d_thresh:.2f}"
-            #)
-            
-            # 2D similarity matrix (dets, tracks)
+
             DD, TT = len(det_xyxys), len(trk_xyxys)
             sim2d = np.zeros((DD, TT), dtype=np.float32)
             for di in range(DD):
@@ -743,37 +563,19 @@ class KalmanMultiObjectTracker:
                     sim2d[di, ti] = float(iou2d_xyxy(det_xyxys[di], trk_xyxys[ti]))
 
             vals2 = sim2d[sim2d > 0]
-            #ger2.info(f"[mot2d frame={self.frame_count} cam={cam_id}] sim2d {_stats(vals2)}")
             best_proj_trk = sim2d.max(axis=0) if sim2d.size else np.array([])
-            #logger2.info(f"[mot2d frame={self.frame_count} cam={cam_id}] best_iou_per_proj_trk {_stats(best_proj_trk)}")
 
             m2, u2d_det, u2d_trk = perform_association_from_similarity(DD, TT, sim2d)
 
-            #pre2_scores = np.array([sim2d[int(di), int(ti)] for di, ti in m2], dtype=float)
-            #logger2.info(
-            #    f"[mot2d frame={self.frame_count} cam={cam_id}] pre_filter matches={len(m2)} "
-            #    f"scores {_stats(pre2_scores)}"
-            #)
 
             m2_filt, _, _ = filter_matches(m2, u2d_det, u2d_trk, sim2d, self.iou2d_thresh)
-            #post2_scores = np.array([sim2d[int(di), int(ti)] for di, ti in m2_filt], dtype=float)
-
-            #logger2.info(
-            #    f"[mot2d frame={self.frame_count} cam={cam_id}] post_filter matches={len(m2_filt)} "
-            #    f"scores {_stats(post2_scores)}"
-            #)
-
-            # use m2_filt from here on
             m2 = m2_filt
 
-
-            # collect candidate matches for heuristic selection
             for di, ti in m2:
-                local_track_i = valid_trk_map[int(ti)]   # index into leftover_tracks
-                det_local_i = int(di)                    # index into det_xyxys list
+                local_track_i = valid_trk_map[int(ti)]
+                det_local_i = int(di)
                 candidate_matches[local_track_i].append((cam_id, det_local_i))
 
-        # choose a single (cam, det) per track: largest projected 3D area (heuristic)
         chosen_matches: Dict[int, Tuple[int, int]] = {}
         for local_track_i, cand_list in candidate_matches.items():
             if len(cand_list) == 1:
@@ -793,7 +595,6 @@ class KalmanMultiObjectTracker:
             if best is not None:
                 chosen_matches[local_track_i] = best
 
-        # apply chosen 2D updates
         for local_track_i, (cam_id, det_local_i) in chosen_matches.items():
             trk = leftover_tracks[local_track_i]
             det_list = yolo_by_cam[int(cam_id)]
